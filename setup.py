@@ -10,7 +10,7 @@ from setuptools import setup
 
 setup(
     name="ari",
-    version="0.1.3",
+    version="0.2.0",
     license="BSD 3-Clause License",
     description="Library for accessing the Asterisk REST Interface",
     long_description=open(os.path.join(os.path.dirname(__file__),
@@ -26,7 +26,16 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: OS Independent",
         "Programming Language :: Python",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.11",
     ],
-    tests_require=["coverage", "httpretty", "nose", "tissue"],
-    install_requires=["swaggerpy"],
+    python_requires='>=3.11',
+    tests_require=[
+        "coverage==7.9.1",
+        "responses==0.25.7",
+    ],
+    install_requires=[
+        "bravado-core==5.17.1",
+        "requests==2.31.0",
+    ],
 )
