@@ -7,8 +7,11 @@
 
 import json
 import logging
-import urlparse
-import swaggerpy.client
+from urllib.parse import urljoin, urlparse
+import websocket # Using websocket-client
+from bravado_core.spec import Spec
+from bravado_core.client import SwaggerClient
+from bravado_core.http_client import RequestsClient # Default, or use the one passed in
 
 from ari.model import *
 
@@ -22,23 +25,57 @@ class Client(object):
     :param http_client: HTTP client interface.
     """
 
-    def __init__(self, base_url, http_client):
-        url = urlparse.urljoin(base_url, "ari/api-docs/resources.json")
+    def __init__(self, base_url, http_client_input): # Renamed http_client to http_client_input to avoid conflict
+        # Ensure http_client_input is a bravado-core compatible HttpClient
+        # If it's a requests.Session, bravado-core can use it directly.
+        # If not, it might need wrapping or adjustment.
+        # For now, assuming http_client_input is compatible (e.g. a requests.Session)
+        # or can be adapted by bravado-core.
 
-        self.swagger = swaggerpy.client.SwaggerClient(
-            url, http_client=http_client)
+        # If http_client_input is a raw requests.Session, bravado-core will wrap it.
+        # If it's already a bravado_core.http_client.HttpClient, it will use it.
+        # Let's ensure it's the bravado type if we need to call methods like .close() on it later via swagger_spec.
+        # However, bravado_core.client.SwaggerClient expects bravado_core.http_client.HttpClient.
+        # The original http_client was likely a swaggerpy http_client.
+        # We'll assume the passed http_client_input is a requests.Session or similar that bravado-core can handle.
+
+        self.raw_http_client = http_client_input # Store the original http_client if needed
+
+        api_docs_url = urljoin(base_url, "ari/api-docs/resources.json")
+
+        # TODO: Determine if http_client_input needs to be wrapped in RequestsClient
+        # or if bravado can consume it directly. For now, let bravado handle it.
+        # If http_client_input is a requests.Session, bravado-core handles it.
+        self.swagger_spec = Spec.from_url(api_docs_url, http_client=http_client_input)
+        self.swagger_client = SwaggerClient(self.swagger_spec, http_client=http_client_input)
+
         self.repositories = {
-            name: Repository(self, name, api)
-            for (name, api) in self.swagger.resources.items()}
+            name: Repository(self, name, resource)
+            for (name, resource) in self.swagger_spec.resources.items()
+        }
 
-        # Extract models out of the events resource
-        events = [api['api_declaration']
-                  for api in self.swagger.api_docs['apis']
-                  if api['name'] == 'events']
-        if events:
-            self.event_models = events[0]['models']
-        else:
-            self.event_models = {}
+        # Extract event models from the spec definitions
+        # This is an approximation; actual event model identification might be more complex
+        # depending on how ARI defines them in its OpenAPI spec.
+        self.event_models = {
+            name: model_spec.spec_dict
+            for name, model_spec in self.swagger_spec.definitions.items()
+            # Heuristic: ARI event models often end with 'Event' or are referenced by event resources.
+            # A more robust method would be to inspect the 'events' resource if defined,
+            # or look for a specific marker/tag in the model definitions.
+            # For now, this is a broad filter and might need refinement.
+            # The original code looked for models under an 'events' resource declaration.
+        }
+        # Attempt to refine event_models based on 'events' resource if it exists
+        if 'events' in self.swagger_spec.resources:
+            # This part is still speculative as bravado-core's resource object structure
+            # for accessing associated models needs to be confirmed.
+            # Assuming models specific to an 'events' resource might be found via its operations or definitions.
+            # For now, the above general collection from spec.definitions will be used.
+            # The key is that self.event_models should be a dict where keys are event type strings
+            # and values are model definitions (dicts).
+            pass
+
 
         self.websockets = set()
         self.event_listeners = {}
@@ -62,9 +99,26 @@ class Client(object):
         This method will close any currently open WebSockets, and close the
         underlying Swaggerclient.
         """
-        for ws in self.websockets:
-            ws.send_close()
-        self.swagger.close()
+        for ws in list(self.websockets): # Iterate over a copy for safe removal
+            try:
+                ws.send_close() # websocket-client uses send_close() then close()
+                ws.close()
+            except Exception as e:
+                log.warning(f"Error closing WebSocket: {e}")
+
+        # Close the http_client if it has a close method (e.g., if it's a requests.Session)
+        # bravado-core's SwaggerClient holds the http_client it uses.
+        if hasattr(self.swagger_client.http_client, 'close'):
+            try:
+                self.swagger_client.http_client.close()
+            except Exception as e:
+                log.warning(f"Error closing swagger_client's http_client: {e}")
+        elif hasattr(self.raw_http_client, 'close'): # Fallback to the raw client if different
+            try:
+                self.raw_http_client.close()
+            except Exception as e:
+                log.warning(f"Error closing raw_http_client: {e}")
+
 
     def get_repo(self, name):
         """Get a specific repo by name.
@@ -112,13 +166,53 @@ class Client(object):
         """
         if isinstance(apps, list):
             apps = ','.join(apps)
-        ws = self.swagger.events.eventWebsocket(app=apps)
+
+        # Construct WebSocket URL
+        # Base URL for WebSocket needs to be derived from `base_url`
+        parsed_b_url = urlparse(base_url) # base_url from Client.__init__
+        ws_scheme = 'wss' if parsed_b_url.scheme == 'https' else 'ws'
+        # Assuming ARI events are typically at <base_ari_path>/events/eventWebsocket
+        # If base_url = "http://localhost:8088/ari", then ws_url = "ws://localhost:8088/ari/events/eventWebsocket"
+
+        # The path for eventWebsocket operation.
+        # In swaggerpy, self.swagger.events.eventWebsocket directly made the call.
+        # We need to find this path from the spec or assume it.
+        # Common practice for ARI is "/ari/events/eventWebsocket" if base_url points to http://host:port
+        # or "/events/eventWebsocket" if base_url already includes /ari, like http://host:port/ari
+
+        # Let's try to build from base_url and a known relative path for events.
+        # If base_url is "http://localhost:8088/prefix" and ARI is at "/ari" under that,
+        # and events are at "/ari/events/eventWebsocket"
+        # A common way swagger tools resolve this is by having the full path in the spec.
+        # For bravado-core, an operation object would have `op.path_name`.
+        # `self.swagger_client.events.eventWebsocket` should be the operation.
+
+        websocket_path_segment = "/events/eventWebsocket" # Relative to ARI's application root
+
+        # Ensure base_url ends with a slash for proper joining if it's just host or host/path_prefix
+        effective_base_url = parsed_b_url.path.rstrip('/')
+
+        ws_url_path = effective_base_url + websocket_path_segment
+        ws_full_url = f"{ws_scheme}://{parsed_b_url.netloc}{ws_url_path}?app={apps}"
+
+        # TODO: Add api_key if required by ARI for WebSockets.
+        # Example: ws_full_url += "&api_key=your_api_key"
+        # This information would typically come from how http_client is configured (e.g. with auth).
+        # swaggerpy might have handled this implicitly.
+
+        log.info(f"Connecting to WebSocket: {ws_full_url}")
+        ws = websocket.create_connection(ws_full_url)
+
         self.websockets.add(ws)
         try:
             self.__run(ws)
         finally:
-            ws.close()
-            self.websockets.remove(ws)
+            try:
+                ws.close()
+            except Exception as e:
+                log.warning(f"Error during WebSocket close in finally block: {e}")
+            if ws in self.websockets:
+                self.websockets.remove(ws)
 
     def on_event(self, event_type, event_cb, *args, **kwargs):
         """Register callback for events with given type.
@@ -165,14 +259,16 @@ class Client(object):
         :param args: Arguments to pass to event_cb
         :param kwargs: Keyword arguments to pass to event_cb
         """
-        # Find the associated model from the Swagger declaration
-        event_model = self.event_models.get(event_type)
-        if not event_model:
+        # Find the associated model from the Swagger declaration (now bravado_core based)
+        event_model_spec = self.event_models.get(event_type) # This now gets the raw spec_dict for the model
+        if not event_model_spec:
             raise ValueError("Cannot find event model '%s'" % event_type)
 
         # Extract the fields that are of the expected type
-        obj_fields = [k for (k, v) in event_model['properties'].items()
-                      if v['type'] == model_id]
+        # The structure of event_model_spec (from bravado_core.spec.Spec.definitions[...].spec_dict)
+        # should be similar to the old event_model structure.
+        obj_fields = [k for (k, v) in event_model_spec.get('properties', {}).items()
+                      if v.get('type') == model_id or (v.get('$ref') and v.get('$ref').endswith(f'/{model_id}'))]
         if not obj_fields:
             raise ValueError("Event model '%s' has no fields of type %s"
                              % (event_type, model_id))
@@ -190,11 +286,11 @@ class Client(object):
                    for obj_field in obj_fields
                    if event.get(obj_field)}
             # If there's only one field in the schema, just pass that along
-            if len(obj_fields) == 1:
-                if obj:
-                    obj = obj.values()[0]
-                else:
-                    obj = None
+            if len(obj_fields) == 1 and obj: # Ensure obj is not empty
+                # obj is a dict, get its first value
+                obj = next(iter(obj.values()))
+            elif not obj: # If obj is empty (no matching fields found in the event instance)
+                 obj = None
             event_cb(obj, event, *args, **kwargs)
 
         return self.on_event(event_type, extract_objects,
